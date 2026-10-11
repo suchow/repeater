@@ -132,12 +132,49 @@ pub fn update_performance(
     })
 }
 
+/// FSRS's estimated probability of recalling the card at `at`, given its stability and the
+/// actual time since its last review.
+pub fn predicted_recall(perf: &ReviewedPerformance, at: DateTime<Utc>) -> f64 {
+    let elapsed_ms = at
+        .signed_duration_since(perf.last_reviewed_at)
+        .num_milliseconds()
+        .max(0) as f64;
+    let elapsed_days = elapsed_ms / (SECONDS_PER_DAY * 1000.0);
+    let memory = MemoryState {
+        stability: perf.stability as f32,
+        difficulty: perf.difficulty as f32,
+    };
+    // The last default parameter is FSRS-6's forgetting-curve decay.
+    let decay = DEFAULT_PARAMETERS[DEFAULT_PARAMETERS.len() - 1];
+    fsrs::current_retrievability(memory, elapsed_days as f32, decay) as f64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Performance, ReviewStatus, ReviewedPerformance, update_performance};
-    use chrono::Duration;
+    use super::{
+        Performance, ReviewStatus, ReviewedPerformance, predicted_recall, update_performance,
+    };
+    use chrono::{Duration, Utc};
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-2
+    }
+
+    #[test]
+    fn predicted_recall_starts_at_one_and_reaches_target_after_one_stability() {
+        let t0 = Utc::now();
+        let perf = ReviewedPerformance {
+            last_reviewed_at: t0,
+            stability: 2.0,
+            difficulty: 5.0,
+            interval_raw: 2.0,
+            interval_days: 2,
+            due_date: t0 + Duration::days(2),
+            review_count: 3,
+        };
+
+        assert!((predicted_recall(&perf, t0) - 1.0).abs() < 1e-6);
+        assert!((predicted_recall(&perf, t0 + Duration::days(2)) - 0.9).abs() < 1e-4);
+        assert!(predicted_recall(&perf, t0 + Duration::days(10)) < 0.9);
     }
 
     #[test]

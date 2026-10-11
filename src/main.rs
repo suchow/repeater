@@ -57,7 +57,7 @@ enum Command {
         /// Drill cards from Apple Notes instead of local files (macOS only).
         #[arg(long, default_value_t = false, conflicts_with = "paths")]
         apple_notes: bool,
-        /// Reveal answers without typing them first, and don't save answers to answers.jsonl.
+        /// Reveal answers without typing them first, and don't log reviews to reviews.jsonl.
         #[arg(long, default_value_t = false)]
         no_typing: bool,
     },

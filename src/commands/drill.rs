@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -5,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::card::{Card, CardContent};
 use crate::cloze_utils::mask_cloze_text;
 use crate::crud::DB;
-use crate::fsrs::{LEARN_AHEAD_THRESHOLD_MINS, ReviewStatus};
+use crate::fsrs::{LEARN_AHEAD_THRESHOLD_MINS, Performance, ReviewStatus, predicted_recall};
 use crate::llm::drill_preprocessor::{AIStatus, DrillPreprocessor};
 use crate::notes::register_apple_notes_cards;
 use crate::palette::Palette;
@@ -48,11 +49,12 @@ pub struct DrillOptions {
     pub shuffle: bool,
     pub retention: f32,
     pub apple_notes: bool,
-    /// Type each answer before revealing it, and append it to answers.jsonl in the data dir.
+    /// Type each answer before revealing it, and log every review to reviews.jsonl in the data dir.
     pub typing: bool,
 }
 
-const ANSWER_LOG_FILE: &str = "answers.jsonl";
+const REVIEW_LOG_FILE: &str = "reviews.jsonl";
+const APP_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+typed-answers");
 
 pub async fn run(db: &DB, opts: DrillOptions) -> Result<()> {
     validate_retention(opts.retention)?;
@@ -78,8 +80,8 @@ pub async fn run(db: &DB, opts: DrillOptions) -> Result<()> {
         return Ok(());
     }
 
-    let answer_log = if opts.typing {
-        Some(get_data_dir()?.join(ANSWER_LOG_FILE))
+    let review_log = if opts.typing {
+        Some(get_data_dir()?.join(REVIEW_LOG_FILE))
     } else {
         None
     };
@@ -93,14 +95,14 @@ pub async fn run(db: &DB, opts: DrillOptions) -> Result<()> {
         drill_preprocessor,
         opts.retention,
         opts.shuffle,
-        answer_log.clone(),
+        review_log.clone(),
     )
     .await?;
 
-    if let Some(log) = answer_log
+    if let Some(log) = review_log
         && log.exists()
     {
-        println!("Typed answers are saved in {}", log.display());
+        println!("Reviews are saved in {}", log.display());
     }
 
     Ok(())
@@ -126,7 +128,13 @@ struct DrillState<'a> {
     retention: f32,
     shuffle: bool,
     typed_answer: String,
-    answer_log: Option<PathBuf>,
+    review_log: Option<PathBuf>,
+    session: Option<SessionInfo>,
+    /// When the current card appeared, and when its answer was revealed.
+    shown_at: DateTime<Utc>,
+    revealed_at: Option<DateTime<Utc>>,
+    reviews_logged: usize,
+    seen_this_session: HashSet<String>,
 }
 struct LastAction {
     action: ReviewStatus,
@@ -164,18 +172,24 @@ impl<'a> DrillState<'a> {
             retention,
             shuffle,
             typed_answer: String::new(),
-            answer_log: None,
+            review_log: None,
+            session: None,
+            shown_at: Utc::now(),
+            revealed_at: None,
+            reviews_logged: 0,
+            seen_this_session: HashSet::new(),
         }
     }
 
-    /// Turns on typing mode: answers are typed before reveal and logged to `answer_log`.
-    fn with_typing(mut self, answer_log: PathBuf) -> Self {
-        self.answer_log = Some(answer_log);
+    /// Turns on typing mode: answers are typed before reveal and logged to `review_log`.
+    fn with_typing(mut self, review_log: PathBuf, session: SessionInfo) -> Self {
+        self.review_log = Some(review_log);
+        self.session = Some(session);
         self
     }
 
     fn typing(&self) -> bool {
-        self.answer_log.is_some()
+        self.review_log.is_some()
     }
 
     fn current_card(&mut self) -> Option<Card> {
@@ -195,20 +209,56 @@ impl<'a> DrillState<'a> {
 
     fn reveal_answer(&mut self) {
         self.show_answer = true;
+        if self.revealed_at.is_none() {
+            self.revealed_at = Some(Utc::now());
+        }
     }
 
     async fn handle_review(&mut self, action: ReviewStatus) -> Result<()> {
         let current_card = self
             .current_card()
             .expect("card should exist when handling review");
+        let reviewed_at = Utc::now();
+        let before = if self.review_log.is_some() {
+            Some(self.db.get_card_performance(&current_card).await?)
+        } else {
+            None
+        };
         let show_again_duration = self
             .db
-            .update_card_performance(&current_card, action, None, self.retention)
+            .update_card_performance(&current_card, action, Some(reviewed_at), self.retention)
             .await?;
-        if let Some(log) = &self.answer_log {
-            let entry = answer_log_entry(&current_card, &self.typed_answer, action, Utc::now());
-            append_answer_log(log, &entry)?;
+        if let Some(before) = before {
+            let after = self.db.get_card_performance(&current_card).await?;
+            let card_state = if self.seen_this_session.contains(&current_card.card_hash) {
+                CardState::Repeat
+            } else if before == Performance::New {
+                CardState::New
+            } else {
+                CardState::Due
+            };
+            let position = self.reviews_logged + 1;
+            if let (Some(log), Some(session)) = (&self.review_log, &self.session) {
+                let entry = review_log_entry(&LoggedReview {
+                    card: &current_card,
+                    typed: &self.typed_answer,
+                    status: action,
+                    shown_at: self.shown_at,
+                    revealed_at: self.revealed_at,
+                    reviewed_at,
+                    before,
+                    after,
+                    card_state,
+                    session,
+                    session_position: position,
+                    retention: self.retention,
+                });
+                append_review_log(log, &entry)?;
+            }
+            self.reviews_logged = position;
         }
+        self.seen_this_session
+            .insert(current_card.card_hash.clone());
         self.typed_answer.clear();
         if action == ReviewStatus::Fail
             || show_again_duration
@@ -224,6 +274,8 @@ impl<'a> DrillState<'a> {
         });
         self.current_idx += 1;
         self.show_answer = false;
+        self.revealed_at = None;
+        self.shown_at = Utc::now();
         Ok(())
     }
 
@@ -262,7 +314,7 @@ async fn start_drill_session(
     drill_preprocessor: DrillPreprocessor,
     retention: f32,
     shuffle: bool,
-    answer_log: Option<PathBuf>,
+    review_log: Option<PathBuf>,
 ) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -293,8 +345,12 @@ async fn start_drill_session(
     };
 
     let mut state = DrillState::new(db, cards, retention, shuffle);
-    if let Some(log) = answer_log {
-        state = state.with_typing(log);
+    if let Some(log) = review_log {
+        let session = SessionInfo {
+            id: timestamp(Utc::now()),
+            host: host_name(),
+        };
+        state = state.with_typing(log, session);
     }
 
     let loop_result: Result<()> = async {
@@ -622,18 +678,93 @@ fn card_view(card: &Card, show_answer: bool, typed: &str) -> Text<'static> {
     view
 }
 
-fn answer_log_entry(
-    card: &Card,
-    typed: &str,
+/// Identifies one drill session in the review log.
+#[derive(Clone, Debug)]
+struct SessionInfo {
+    id: String,
+    host: String,
+}
+
+/// How a card arrived in this review: never reviewed, due, or seen earlier this session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardState {
+    New,
+    Due,
+    Repeat,
+}
+
+impl CardState {
+    fn label(&self) -> &'static str {
+        match self {
+            CardState::New => "new",
+            CardState::Due => "due",
+            CardState::Repeat => "repeat",
+        }
+    }
+}
+
+/// Everything recorded about one review in the review log.
+struct LoggedReview<'a> {
+    card: &'a Card,
+    typed: &'a str,
     status: ReviewStatus,
+    shown_at: DateTime<Utc>,
+    revealed_at: Option<DateTime<Utc>>,
     reviewed_at: DateTime<Utc>,
-) -> Value {
-    let (question, answer) = match &card.content {
-        CardContent::Basic { question, answer } => (question.clone(), answer.clone()),
+    before: Performance,
+    after: Performance,
+    card_state: CardState,
+    session: &'a SessionInfo,
+    session_position: usize,
+    retention: f32,
+}
+
+fn timestamp(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn secs_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
+    to.signed_duration_since(from).num_milliseconds() as f64 / 1000.0
+}
+
+fn performance_json(perf: &Performance) -> Value {
+    match perf {
+        Performance::New => Value::Null,
+        Performance::Reviewed(p) => json!({
+            "last_reviewed_at": timestamp(p.last_reviewed_at),
+            "stability": p.stability,
+            "difficulty": p.difficulty,
+            "interval_days": p.interval_raw,
+            "due_date": timestamp(p.due_date),
+            "review_count": p.review_count,
+        }),
+    }
+}
+
+/// One line of the review log. Basic cards log only the short answer (the first paragraph),
+/// not the context paragraph that follows it.
+fn review_log_entry(review: &LoggedReview<'_>) -> Value {
+    let card = review.card;
+    let before = match review.before {
+        Performance::Reviewed(p) => Some(p),
+        Performance::New => None,
+    };
+    let (kind, question, answer) = match &card.content {
+        CardContent::Basic { question, answer } => (
+            "basic",
+            question.clone(),
+            answer
+                .split("\n\n")
+                .next()
+                .unwrap_or("")
+                .trim_end()
+                .to_string(),
+        ),
         CardContent::Cloze {
             text,
             cloze_range: Some(range),
         } => (
+            "cloze",
             mask_cloze_text(text, range),
             text[range.start..range.end]
                 .trim_start_matches('[')
@@ -643,27 +774,53 @@ fn answer_log_entry(
         CardContent::Cloze {
             text,
             cloze_range: None,
-        } => (text.clone(), String::new()),
+        } => ("cloze", text.clone(), String::new()),
     };
     json!({
-        "reviewed_at": reviewed_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "reviewed_at": timestamp(review.reviewed_at),
+        "shown_at": timestamp(review.shown_at),
+        "revealed_at": review.revealed_at.map(timestamp),
+        "recall_secs": review.revealed_at.map(|r| secs_between(review.shown_at, r)),
+        "answer_secs": review.revealed_at.map(|r| secs_between(r, review.reviewed_at)),
         "file": card.file_path.display().to_string(),
         "card_hash": card.card_hash,
+        "kind": kind,
         "question": question,
         "answer": answer,
-        "typed": typed,
-        "result": status.label().to_lowercase(),
+        "typed": review.typed,
+        "result": review.status.label().to_lowercase(),
+        "card_state": review.card_state.label(),
+        "session_id": review.session.id,
+        "session_position": review.session_position,
+        "retention": (review.retention as f64 * 10_000.0).round() / 10_000.0,
+        "host": review.session.host,
+        "app_version": APP_VERSION,
+        "elapsed_days": before.map(|p| secs_between(p.last_reviewed_at, review.reviewed_at) / 86_400.0),
+        "predicted_recall": before.map(|p| predicted_recall(&p, review.reviewed_at)),
+        "before": performance_json(&review.before),
+        "after": performance_json(&review.after),
     })
 }
 
-fn append_answer_log(path: &Path, entry: &Value) -> Result<()> {
+/// The machine's name, so reviews from different Macs can be told apart.
+fn host_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn append_review_log(path: &Path, entry: &Value) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("failed to open answer log {}", path.display()))?;
+        .with_context(|| format!("failed to open review log {}", path.display()))?;
     writeln!(file, "{}", entry)
-        .with_context(|| format!("failed to write answer log {}", path.display()))?;
+        .with_context(|| format!("failed to write review log {}", path.display()))?;
     Ok(())
 }
 
@@ -700,6 +857,7 @@ mod tests {
     use crate::cloze_utils::find_cloze_ranges;
 
     use super::*;
+    use crate::fsrs::ReviewedPerformance;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -1002,15 +1160,72 @@ mod tests {
         assert!(lines.iter().any(|l| l == "Your answer: cardinality"));
     }
 
+    fn test_session() -> SessionInfo {
+        SessionInfo {
+            id: "2026-10-11T17:59:00.000Z".into(),
+            host: "test-mac".into(),
+        }
+    }
+
+    /// `fixed_time()` plus some seconds (negative for earlier).
+    fn at(secs: f64) -> DateTime<Utc> {
+        fixed_time() + chrono::Duration::milliseconds((secs * 1000.0).round() as i64)
+    }
+
+    fn reviewed(last_reviewed_secs: f64, stability: f64, review_count: usize) -> Performance {
+        Performance::Reviewed(ReviewedPerformance {
+            last_reviewed_at: at(last_reviewed_secs),
+            stability,
+            difficulty: 5.0,
+            interval_raw: stability,
+            interval_days: stability as usize,
+            due_date: at(last_reviewed_secs + stability * 86_400.0),
+            review_count,
+        })
+    }
+
+    /// A Fail review: card shown at 18:00:00, revealed at 18:00:12.5, graded at 18:00:15.
+    fn logged<'a>(
+        card: &'a Card,
+        session: &'a SessionInfo,
+        before: Performance,
+        card_state: CardState,
+    ) -> LoggedReview<'a> {
+        LoggedReview {
+            card,
+            typed: "Lyon",
+            status: ReviewStatus::Fail,
+            shown_at: at(0.0),
+            revealed_at: Some(at(12.5)),
+            reviewed_at: at(15.0),
+            before,
+            after: reviewed(15.0, 1.0, 1),
+            card_state,
+            session,
+            session_position: 3,
+            retention: 0.9,
+        }
+    }
+
     #[test]
-    fn answer_log_entry_for_basic_card_records_all_fields() {
-        let card = basic_card_with_hash("Capital of France?", "Paris", "hash-p");
+    fn review_log_file_is_named_reviews_jsonl() {
+        assert_eq!(REVIEW_LOG_FILE, "reviews.jsonl");
+    }
 
-        let entry = answer_log_entry(&card, "Lyon", ReviewStatus::Fail, fixed_time());
+    #[test]
+    fn review_log_entry_records_card_short_answer_typed_text_and_result() {
+        let card = basic_card_with_hash(
+            "Capital of France?",
+            "Paris\n\nIt has been the capital for most of the last thousand years.",
+            "hash-p",
+        );
+        let session = test_session();
 
-        assert_eq!(entry["reviewed_at"], "2026-10-11T18:00:00Z");
+        let entry = review_log_entry(&logged(&card, &session, Performance::New, CardState::New));
+
         assert_eq!(entry["file"], "test.md");
         assert_eq!(entry["card_hash"], "hash-p");
+        assert_eq!(entry["kind"], "basic");
         assert_eq!(entry["question"], "Capital of France?");
         assert_eq!(entry["answer"], "Paris");
         assert_eq!(entry["typed"], "Lyon");
@@ -1018,23 +1233,93 @@ mod tests {
     }
 
     #[test]
-    fn answer_log_entry_for_cloze_uses_masked_text_and_hidden_words() {
-        let card = cloze_card("The [order] of a group is [its size].", 1);
+    fn review_log_entry_records_timing_to_the_millisecond() {
+        let card = basic_card("Q?", "A");
+        let session = test_session();
 
-        let entry = answer_log_entry(&card, "its size", ReviewStatus::Pass, fixed_time());
+        let entry = review_log_entry(&logged(&card, &session, Performance::New, CardState::New));
 
-        assert_eq!(entry["question"], "The [order] of a group is [________].");
-        assert_eq!(entry["answer"], "its size");
-        assert_eq!(entry["result"], "pass");
+        assert_eq!(entry["shown_at"], "2026-10-11T18:00:00.000Z");
+        assert_eq!(entry["revealed_at"], "2026-10-11T18:00:12.500Z");
+        assert_eq!(entry["reviewed_at"], "2026-10-11T18:00:15.000Z");
+        assert_eq!(entry["recall_secs"], 12.5);
+        assert_eq!(entry["answer_secs"], 2.5);
     }
 
     #[test]
-    fn append_answer_log_writes_one_json_object_per_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("answers.jsonl");
+    fn review_log_entry_for_new_card_has_no_prior_state() {
+        let card = basic_card("Q?", "A");
+        let session = test_session();
 
-        append_answer_log(&path, &serde_json::json!({"n": 1})).unwrap();
-        append_answer_log(&path, &serde_json::json!({"n": 2})).unwrap();
+        let entry = review_log_entry(&logged(&card, &session, Performance::New, CardState::New));
+
+        assert_eq!(entry["card_state"], "new");
+        assert!(entry["before"].is_null());
+        assert!(entry["elapsed_days"].is_null());
+        assert!(entry["predicted_recall"].is_null());
+        assert_eq!(entry["after"]["review_count"], 1);
+        assert_eq!(entry["after"]["due_date"], "2026-10-12T18:00:15.000Z");
+    }
+
+    #[test]
+    fn review_log_entry_for_due_card_records_elapsed_time_and_predicted_recall() {
+        let card = basic_card("Q?", "A");
+        let session = test_session();
+        let two_days_before_grading = 15.0 - 2.0 * 86_400.0;
+
+        let entry = review_log_entry(&logged(
+            &card,
+            &session,
+            reviewed(two_days_before_grading, 2.0, 3),
+            CardState::Due,
+        ));
+
+        assert_eq!(entry["card_state"], "due");
+        assert_eq!(entry["before"]["review_count"], 3);
+        assert_eq!(entry["before"]["stability"], 2.0);
+        assert_eq!(entry["elapsed_days"], 2.0);
+        let recall = entry["predicted_recall"].as_f64().unwrap();
+        assert!((recall - 0.9).abs() < 1e-4, "predicted recall {recall}");
+    }
+
+    #[test]
+    fn review_log_entry_records_session_and_settings() {
+        let card = basic_card("Q?", "A");
+        let session = test_session();
+
+        let entry = review_log_entry(&logged(&card, &session, Performance::New, CardState::New));
+
+        assert_eq!(entry["session_id"], "2026-10-11T17:59:00.000Z");
+        assert_eq!(entry["session_position"], 3);
+        assert_eq!(entry["retention"], 0.9);
+        assert_eq!(entry["host"], "test-mac");
+        assert!(
+            entry["app_version"]
+                .as_str()
+                .unwrap()
+                .ends_with("+typed-answers")
+        );
+    }
+
+    #[test]
+    fn review_log_entry_for_cloze_uses_masked_text_and_hidden_words() {
+        let card = cloze_card("The [order] of a group is [its size].", 1);
+        let session = test_session();
+
+        let entry = review_log_entry(&logged(&card, &session, Performance::New, CardState::New));
+
+        assert_eq!(entry["kind"], "cloze");
+        assert_eq!(entry["question"], "The [order] of a group is [________].");
+        assert_eq!(entry["answer"], "its size");
+    }
+
+    #[test]
+    fn append_review_log_writes_one_json_object_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.jsonl");
+
+        append_review_log(&path, &serde_json::json!({"n": 1})).unwrap();
+        append_review_log(&path, &serde_json::json!({"n": 2})).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let ns: Vec<i64> = contents
@@ -1049,7 +1334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_review_is_logged_and_input_is_cleared() {
+    async fn typed_reviews_in_a_session_log_state_position_and_history() {
         let db = DB::new_in_memory().await.unwrap();
         let cards = vec![basic_card_with_hash(
             "Capital of France?",
@@ -1058,21 +1343,40 @@ mod tests {
         )];
         db.add_cards_batch(&cards).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("answers.jsonl");
-        let mut state = DrillState::new(&db, cards, 0.9, false).with_typing(log.clone());
+        let log = dir.path().join("reviews.jsonl");
+        let mut state =
+            DrillState::new(&db, cards, 0.9, false).with_typing(log.clone(), test_session());
+
         state.typed_answer = "Lyon".into();
         state.reveal_answer();
-
         state.handle_review(ReviewStatus::Fail).await.unwrap();
-
-        let contents = std::fs::read_to_string(&log).unwrap();
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let entry: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(entry["typed"], "Lyon");
-        assert_eq!(entry["answer"], "Paris");
-        assert_eq!(entry["result"], "fail");
         assert!(state.typed_answer.is_empty());
+        state.typed_answer = "Paris".into();
+        state.reveal_answer();
+        state.handle_review(ReviewStatus::Pass).await.unwrap();
+
+        let entries: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        let (first, second) = (&entries[0], &entries[1]);
+        assert_eq!(first["typed"], "Lyon");
+        assert_eq!(first["result"], "fail");
+        assert_eq!(first["card_state"], "new");
+        assert_eq!(first["session_position"], 1);
+        assert!(first["before"].is_null());
+        assert_eq!(first["after"]["review_count"], 1);
+        assert!(first["revealed_at"].is_string());
+        assert!(first["recall_secs"].as_f64().unwrap() >= 0.0);
+        assert_eq!(second["typed"], "Paris");
+        assert_eq!(second["result"], "pass");
+        assert_eq!(second["card_state"], "repeat");
+        assert_eq!(second["session_position"], 2);
+        assert_eq!(second["before"]["review_count"], 1);
+        assert_eq!(second["after"]["review_count"], 2);
+        assert!(second["elapsed_days"].as_f64().unwrap() >= 0.0);
     }
 
     #[test]
@@ -1080,7 +1384,7 @@ mod tests {
         let db = in_memory_db();
         let dir = tempfile::tempdir().unwrap();
         let state = DrillState::new(&db, vec![basic_card("Q", "A")], 0.9, false)
-            .with_typing(dir.path().join("answers.jsonl"));
+            .with_typing(dir.path().join("reviews.jsonl"), test_session());
 
         let line = flatten_line(&instructions_text(&state)[0]);
 
