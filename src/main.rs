@@ -57,6 +57,9 @@ enum Command {
         /// Drill cards from Apple Notes instead of local files (macOS only).
         #[arg(long, default_value_t = false, conflicts_with = "paths")]
         apple_notes: bool,
+        /// Reveal answers without typing them first, and don't save answers to answers.jsonl.
+        #[arg(long, default_value_t = false)]
+        no_typing: bool,
     },
     /// Re-index decks and show collection stats
     Check {
@@ -124,6 +127,7 @@ async fn run_cli() -> Result<()> {
             shuffle,
             retention,
             apple_notes,
+            no_typing,
         } => {
             drill::run(&db, DrillOptions {
                 paths,
@@ -133,6 +137,7 @@ async fn run_cli() -> Result<()> {
                 shuffle,
                 retention,
                 apple_notes,
+                typing: !no_typing,
             }).await?;
         }
         Command::Check { paths, plain, apple_notes } => {
