@@ -50,31 +50,32 @@ Tradeoff:
 
 Classic FSRS expects four answer buttons. `repeater` distills that into two hotkeys: `Pass` and `Fail`. Internally those map to quality scores of 3 and 1 respectively, so the formulas for `initial_stability`, `initial_difficulty`, `delta_d`, and `calculate_stability` still behave correctly. The benefit is a fast keyboard workflow; the trade-off is that you can't express nuances like "Hard" or "Easy", so the algorithm falls back to its conservative defaults when scheduling recoveries after a lapse.
 
-## Early Review Ramp
+## Learning Steps
 
-FSRS is designed for day-scale intervals, so the code layers a short-term trainer on top:
+FSRS is designed for day-scale intervals, so the code adds short same-day steps for cards you miss:
 
-| Review count before the answer | Result | Max delay |
+| Card | Result | Next review |
 | --- | --- | --- |
-| 0 (brand new) | Pass/Fail | 1 minute |
-| 1 | Pass | 10 minutes |
-| 1 | Fail | 1 minute |
-| 2 | Pass | 1 day |
-| 2 | Fail | 10 minutes |
+| Any card | Fail | 1 minute (step 1) |
+| Waiting on step 1 | Pass | 10 minutes (step 2) |
+| Waiting on step 2 | Pass | FSRS interval, at least 1 day |
+| Anything else, including a brand-new card | Pass | FSRS interval, at least 1 day |
 
-These caps override the usual interval just for the first few answers, which keeps new material in front of you until you can reliably recall it. Once the review count exceeds two, the pure FSRS interval is used.
+A miss at any point starts the steps over. A card you pass the first time you see it skips the steps entirely, because typing the right answer before ever seeing the card is already good evidence that you know it.
+
+FSRS intervals are never shorter than a day, so same-day reviews come only from the steps. FSRS sees same-day reviews as 0 days elapsed and applies its short-term formula to them.
 
 ## Learn-Ahead Window & Queueing
 
 - The spaced repetition queue treats anything due within the next 20 minutes as "due now". This is the `LEARN_AHEAD_THRESHOLD_MINS`, and it means that when you sit down for a session you see cards that are about to become due so you don't have to reopen the app later in the day.
-- During a drill, the interval returned from FSRS is compared against the same threshold. If it's shorter than 20 minutes (for example right after a lapse) the card is immediately re-queued in the current session instead of waiting for a later run.
+- During a drill, the interval returned from FSRS is compared against the same threshold. If it's shorter than 20 minutes (the learning steps after a miss) the card is immediately re-queued in the current session instead of waiting for a later run.
 - The daily queue pulls overdue cards first, then cards due later today, and only then does it sprinkle in new cards—subject to your optional daily limits. That ordering makes sure FSRS's promises ("you'll keep your target recall") remain accurate even if you have a backlog.
 
 ## What Happens After Each Answer
 
 1. The elapsed time since the last review is measured to compute the recall probability FSRS expected at the moment you answered.
 2. Depending on whether you pressed `Pass` or `Fail`, the algorithm updates stability and difficulty with the upstream formulas.
-3. A new interval is solved for your target recall (`--retention`, default `0.9`), rounded, clamped, and—if applicable—shortened by the early-review caps above.
+3. A new interval is solved for your target recall (`--retention`, default `0.9`), rounded, and given at least 1 day, unless the card is in the learning steps above.
 4. Metadata in `cards.db` is updated atomically so stats, the `check` command, and future sessions all agree on the next due date.
 
 ## Further Reading

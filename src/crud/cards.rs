@@ -281,76 +281,79 @@ mod tests {
         let due_today_cards = db.due_today(&card_hashes, None, None).await.unwrap();
         assert_eq!(due_today_cards.len(), 1);
 
-        // check short-term scheduling
-        for _ in 0..3 {
-            db.update_card_performance(&card, ReviewStatus::Pass, None, 0.9)
-                .await
-                .unwrap();
-        }
+        // a pass on first sight skips the learning steps
+        let now = chrono::Utc::now();
+        db.update_card_performance(&card, ReviewStatus::Pass, Some(now), 0.9)
+            .await
+            .unwrap();
 
         match db.get_card_performance(&card).await.unwrap() {
             Performance::Reviewed(reviewed) => {
-                assert_eq!(reviewed.review_count, 3);
-                assert_eq!(reviewed.interval_raw, 1.0);
+                assert_eq!(reviewed.review_count, 1);
+                assert_eq!(reviewed.interval_raw, 2.3065046296296297);
+                assert_eq!(reviewed.interval_days, 2);
             }
             _ => panic!(),
         }
 
         // wait the interval and then pass again
-        let mut future_time = chrono::Utc::now() + chrono::Duration::days(1);
+        let mut future_time = now + chrono::Duration::days(2);
         db.update_card_performance(&card, ReviewStatus::Pass, Some(future_time), 0.9)
+            .await
+            .unwrap();
+
+        match db.get_card_performance(&card).await.unwrap() {
+            Performance::Reviewed(reviewed) => {
+                assert_eq!(reviewed.review_count, 2);
+                assert_eq!(reviewed.interval_raw, 10.964340277777778);
+                assert_eq!(reviewed.interval_days, 10);
+            }
+            _ => panic!(),
+        }
+
+        // wait the interval and then pass again
+        future_time += chrono::Duration::days(10);
+        db.update_card_performance(&card, ReviewStatus::Pass, Some(future_time), 0.9)
+            .await
+            .unwrap();
+
+        match db.get_card_performance(&card).await.unwrap() {
+            Performance::Reviewed(reviewed) => {
+                assert_eq!(reviewed.review_count, 3);
+                assert_eq!(reviewed.interval_raw, 43.93167824074074);
+                assert_eq!(reviewed.interval_days, 43);
+            }
+            _ => panic!(),
+        }
+
+        // now collapse it with a failure, which starts the learning steps
+        future_time += chrono::Duration::days(43);
+        db.update_card_performance(&card, ReviewStatus::Fail, Some(future_time), 0.9)
             .await
             .unwrap();
 
         match db.get_card_performance(&card).await.unwrap() {
             Performance::Reviewed(reviewed) => {
                 assert_eq!(reviewed.review_count, 4);
-                assert_eq!(reviewed.interval_raw, 7.32306712962963);
-                assert_eq!(reviewed.interval_days, 7);
+                assert_eq!(reviewed.interval_raw, 60.0 / 86_400.0);
+                assert_eq!(reviewed.interval_days, 0);
             }
             _ => panic!(),
         }
 
-        // wait the interval and then pass again
-        future_time += chrono::Duration::days(7);
-        db.update_card_performance(&card, ReviewStatus::Pass, Some(future_time), 0.9)
-            .await
-            .unwrap();
-
-        match db.get_card_performance(&card).await.unwrap() {
-            Performance::Reviewed(reviewed) => {
-                assert_eq!(reviewed.review_count, 5);
-                assert_eq!(reviewed.interval_raw, 31.727581018518517);
-                assert_eq!(reviewed.interval_days, 31);
-            }
-            _ => panic!(),
+        // pass both steps, and FSRS takes over again
+        for step in [chrono::Duration::minutes(1), chrono::Duration::minutes(10)] {
+            future_time += step;
+            db.update_card_performance(&card, ReviewStatus::Pass, Some(future_time), 0.9)
+                .await
+                .unwrap();
         }
-
-        // now collapse it with a failure
-        future_time += chrono::Duration::days(31);
-        db.update_card_performance(&card, ReviewStatus::Fail, Some(future_time), 0.9)
-            .await
-            .unwrap();
 
         match db.get_card_performance(&card).await.unwrap() {
             Performance::Reviewed(reviewed) => {
                 assert_eq!(reviewed.review_count, 6);
-                assert_eq!(reviewed.interval_raw, 2.5044675925925928);
+                assert_eq!(reviewed.interval_raw, 2.8663773148148146);
                 assert_eq!(reviewed.interval_days, 2);
-            }
-            _ => panic!(),
-        }
-
-        // another failure
-        future_time += chrono::Duration::days(2);
-        db.update_card_performance(&card, ReviewStatus::Fail, Some(future_time), 0.9)
-            .await
-            .unwrap();
-
-        match db.get_card_performance(&card).await.unwrap() {
-            Performance::Reviewed(reviewed) => {
-                assert_eq!(reviewed.review_count, 7);
-                assert_eq!(reviewed.interval_raw, 0.5897800925925926);
             }
             _ => panic!(),
         }

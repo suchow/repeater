@@ -6,19 +6,21 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 
 pub const LEARN_AHEAD_THRESHOLD_MINS: Duration = Duration::minutes(20);
 
-fn early_interval_cap(review_count: usize, review_status: ReviewStatus) -> Option<Duration> {
-    match review_count {
-        0 => Some(Duration::minutes(1)),
-        1 => match review_status {
-            ReviewStatus::Pass => Some(Duration::minutes(10)),
-            ReviewStatus::Fail => Some(Duration::minutes(1)),
-        },
-        2 => match review_status {
-            ReviewStatus::Pass => Some(Duration::days(1)),
-            ReviewStatus::Fail => Some(Duration::minutes(10)),
-        },
-        _ => None,
-    }
+/// Same-day steps for a card you missed. A miss brings the card back after the first step, each
+/// pass moves it to the next step, and passing the last step hands it back to FSRS. A miss at any
+/// point starts the steps over. A card you pass without a miss skips them.
+const LEARNING_STEPS: [Duration; 2] = [Duration::minutes(1), Duration::minutes(10)];
+
+/// Shortest interval FSRS may set, so same-day reviews come only from the learning steps.
+const MIN_FSRS_INTERVAL: Duration = Duration::days(1);
+
+/// The learning step a card is waiting on, if any. Steps are the only intervals shorter than a
+/// day, so a card's current interval identifies its step.
+fn current_learning_step(perf: &ReviewedPerformance) -> Option<usize> {
+    let interval_secs = (perf.interval_raw * SECONDS_PER_DAY).round() as i64;
+    LEARNING_STEPS
+        .iter()
+        .position(|step| step.num_seconds() == interval_secs)
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -92,16 +94,17 @@ pub fn update_performance(
         ),
     };
 
+    let learning_step = match &perf {
+        Performance::Reviewed(p) => current_learning_step(p),
+        Performance::New => None,
+    };
+
+    // Whole days since the last review. Same-day reviews (the learning steps) count as 0, so FSRS
+    // uses its short-term formula for them.
     let elapsed_days = last_reviewed_at
         .map(|last| {
-            if review_count < 3 {
-                return 0;
-            }
             let secs = reviewed_at.signed_duration_since(last).num_seconds().max(0) as f64;
-            let days = secs / SECONDS_PER_DAY;
-            // Ensure sub-day intervals count as at least 1 day for FSRS,
-            // allowing stability to update
-            days.max(1.0).round() as u32
+            (secs / SECONDS_PER_DAY).round() as u32
         })
         .unwrap_or(0);
 
@@ -113,9 +116,13 @@ pub fn update_performance(
     let fsrs_seconds = (interval_raw * SECONDS_PER_DAY).round().max(1.0) as i64;
     let fsrs_duration = Duration::seconds(fsrs_seconds);
 
-    let interval_duration = early_interval_cap(review_count, review_status)
-        .map(|cap| fsrs_duration.min(cap))
-        .unwrap_or(fsrs_duration);
+    let interval_duration = match (review_status, learning_step) {
+        (ReviewStatus::Fail, _) => LEARNING_STEPS[0],
+        (ReviewStatus::Pass, Some(step)) if step + 1 < LEARNING_STEPS.len() => {
+            LEARNING_STEPS[step + 1]
+        }
+        (ReviewStatus::Pass, _) => fsrs_duration.max(MIN_FSRS_INTERVAL),
+    };
 
     let interval_effective_days = interval_duration.num_seconds() as f64 / SECONDS_PER_DAY;
     let interval_days = interval_duration.num_days().max(0) as usize;
@@ -178,11 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn test_update_new_card() {
+    fn first_pass_skips_learning_steps() {
         let reviewed_at = chrono::Utc::now();
 
         let result = update_performance(Performance::New, ReviewStatus::Pass, reviewed_at, 0.9);
-        dbg!(result.as_ref().unwrap());
         let ReviewedPerformance {
             last_reviewed_at,
             stability,
@@ -195,35 +201,53 @@ mod tests {
         assert_eq!(last_reviewed_at, reviewed_at);
         assert!(approx_eq(stability, 2.30649995803833));
         assert!(approx_eq(difficulty, 2.1181039810180664));
-        assert!(approx_eq(interval_raw, 0.0006944444444444445));
-        assert_eq!(interval_days, 0);
+        assert!(approx_eq(interval_raw, 2.3065046296296297));
+        assert_eq!(interval_days, 2);
         assert_eq!(review_count, 1);
     }
 
+    /// Reviews `perf` with each result in turn, each at the moment the card comes due.
+    fn review_in_turn(mut perf: Performance, results: &[ReviewStatus]) -> Vec<ReviewedPerformance> {
+        let mut reviewed_at = chrono::Utc::now();
+        let mut out = Vec::new();
+        for &result in results {
+            let next = update_performance(perf, result, reviewed_at, 0.9).unwrap();
+            reviewed_at = next.due_date;
+            perf = Performance::Reviewed(next);
+            out.push(next);
+        }
+        out
+    }
+
     #[test]
-    fn test_short_term_learning() {
-        let now = chrono::Utc::now();
-        let duration = Duration::days(3);
-        let last_reviewed_at = now - duration;
-        let initial_perf = ReviewedPerformance {
-            last_reviewed_at,
-            stability: 3.0,
-            difficulty: 5.0,
-            interval_raw: 3.0,
-            interval_days: 3,
-            due_date: now,
-            review_count: 1,
-        };
-        let result = update_performance(
-            Performance::Reviewed(initial_perf),
-            ReviewStatus::Pass,
-            now,
-            0.9,
-        )
-        .unwrap();
-        assert_eq!(result.last_reviewed_at, now);
-        assert!(result.interval_days == 0);
-        assert_eq!(result.review_count, 2);
+    fn miss_goes_through_learning_steps() {
+        use ReviewStatus::{Fail, Pass};
+        let reviews = review_in_turn(Performance::New, &[Fail, Pass, Pass]);
+        assert_eq!(
+            reviews[0].due_date - reviews[0].last_reviewed_at,
+            Duration::minutes(1)
+        );
+        assert_eq!(
+            reviews[1].due_date - reviews[1].last_reviewed_at,
+            Duration::minutes(10)
+        );
+        // Passing the last step hands the card to FSRS, which never schedules less than a day.
+        assert_eq!(reviews[2].interval_raw, 1.0);
+        assert_eq!(reviews[2].interval_days, 1);
+    }
+
+    #[test]
+    fn miss_during_learning_steps_starts_them_over() {
+        use ReviewStatus::{Fail, Pass};
+        let reviews = review_in_turn(Performance::New, &[Fail, Pass, Fail, Pass]);
+        assert_eq!(
+            reviews[2].due_date - reviews[2].last_reviewed_at,
+            Duration::minutes(1)
+        );
+        assert_eq!(
+            reviews[3].due_date - reviews[3].last_reviewed_at,
+            Duration::minutes(10)
+        );
     }
 
     #[test]
@@ -245,7 +269,9 @@ mod tests {
             0.9,
         )
         .unwrap();
-        assert_eq!(result.interval_raw, 0.7213425925925926);
+        // A lapse goes back into the learning steps.
+        assert_eq!(result.due_date - now, Duration::minutes(1));
+        assert!(result.stability < 3.0);
         assert_eq!(result.review_count, 4);
     }
 
@@ -258,39 +284,21 @@ mod tests {
             difficulty: 5.0,
             interval_raw: 4.0,
             interval_days: 4,
-            due_date: now + Duration::days(4),
+            due_date: now,
             review_count: 4,
         };
-        let result = update_performance(
-            Performance::Reviewed(initial_perf),
-            ReviewStatus::Fail,
-            now,
-            0.9,
-        )
-        .unwrap();
-        assert_eq!(result.interval_raw, 0.7213425925925926);
-        assert_eq!(result.review_count, 5);
-
-        // different retention
-        let now = chrono::Utc::now();
-        let initial_perf = ReviewedPerformance {
-            last_reviewed_at: now - Duration::days(4),
-            stability: 3.0,
-            difficulty: 5.0,
-            interval_raw: 4.0,
-            interval_days: 4,
-            due_date: now + Duration::days(4),
-            review_count: 4,
+        let interval_at = |retention| {
+            update_performance(
+                Performance::Reviewed(initial_perf),
+                ReviewStatus::Pass,
+                now,
+                retention,
+            )
+            .unwrap()
+            .interval_raw
         };
-        let result = update_performance(
-            Performance::Reviewed(initial_perf),
-            ReviewStatus::Fail,
-            now,
-            0.6,
-        )
-        .unwrap();
-        assert_eq!(result.interval_raw, 19.46959490740741);
-        assert_eq!(result.review_count, 5);
+        assert_eq!(interval_at(0.9), 12.850474537037037);
+        assert_eq!(interval_at(0.6), 346.84609953703705);
     }
 
     /// Test that cards can recover from a "stuck" state after multiple failures.
@@ -323,8 +331,9 @@ mod tests {
             after_fails.difficulty
         );
 
-        // Simulate 4 consecutive passes - card should recover
-        for _ in 0..4 {
+        // Simulate 5 consecutive passes - two clear the learning steps, then daily reviews
+        // rebuild stability
+        for _ in 0..5 {
             let reviewed_perf =
                 update_performance(perf, ReviewStatus::Pass, time_reviewed, 0.9).unwrap();
             time_reviewed = reviewed_perf.due_date;
@@ -337,12 +346,12 @@ mod tests {
         };
         assert!(
             after_passes.stability > 1.0,
-            "After 4 passes, stability should recover above 1.0, got {}",
+            "After 5 passes, stability should recover above 1.0, got {}",
             after_passes.stability
         );
         assert!(
             after_passes.interval_raw > 1.0,
-            "After 4 passes, interval should be > 1 day, got {}",
+            "After 5 passes, interval should be > 1 day, got {}",
             after_passes.interval_raw
         );
     }
